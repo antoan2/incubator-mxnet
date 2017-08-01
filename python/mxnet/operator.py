@@ -648,6 +648,11 @@ def register(reg_name):
                     n_aux = len(op_prop.list_auxiliary_states())
                     assert num_tensor == n_in + n_out + n_aux
 
+                    # Reminiz patch 1
+                    for i in range(n_in):
+                        if tensor_types[i] == -1:
+                            tensor_types[i] = tensor_types[0]
+
                     types = [_DTYPE_MX_TO_NP[tensor_types[i]] for i in range(n_in)]
                     ret = op_prop.infer_type(types)
                     if len(ret) == 2:
