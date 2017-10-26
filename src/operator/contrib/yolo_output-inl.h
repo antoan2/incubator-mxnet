@@ -305,6 +305,23 @@ struct nms_assign {
   }
 };
 
+// Using `sigmoid` and `exp` from mshadow_op leads to bugs, so 
+// we use these
+struct fixed_exp {
+  template<typename DType>
+  MSHADOW_XINLINE static DType Map(DType a) {
+    return math::exp(static_cast<float>(a));
+  }
+};
+
+struct fixed_sigmoid {
+  template<typename DType>
+  MSHADOW_XINLINE static DType Map(DType a) {
+    float af(static_cast<float>(a));
+    return DType(1.0f / (1.0f + math::exp(-af)));
+  }
+};
+
 template<typename xpu, typename DType>
 class YoloOutputOp : public Operator {
  public:
@@ -351,7 +368,7 @@ class YoloOutputOp : public Operator {
      ScalarExp<DType> in_w = ScalarExp<DType>(1.0 / data.shape_[3]);
      ScalarExp<DType> in_h = ScalarExp<DType>(1.0 / data.shape_[2]);
 
-     // change the order of dimensions;
+      //change the order of dimensions;
      temp = reshape(transpose(data, Shape4(0, 2, 3, 1)), temp.shape_);
      softmax_in = transpose(slice<2>(temp, 0, nc), Shape3(0, 2, 1));
      Softmax(softmax_out, softmax_in);
@@ -360,11 +377,14 @@ class YoloOutputOp : public Operator {
      slice<2>(out, 0, 1) = transpose(reduce_keepdim<red::maximum, true>(
        softmax_out, 1), Shape3(0, 2, 1));
      // apply logistic to score, x, y
-     slice<2>(temp, nc, nc + 3) = F<mshadow_op::sigmoid>(slice<2>(temp, nc, nc + 3));
+     slice<2>(temp, nc, nc + 3) = F<fixed_sigmoid>(slice<2>(temp, nc, nc + 3));
      // scores to output
      slice<2>(out, 1, 2) = F<mshadow_op::identity>(slice<2>(
       temp, nc, nc + 1));
      // x = (logistic(pred[0]) + i) / in_w
+
+
+
      tshape[2] = 1;
      slice<2>(out, 2, 3) = in_w * (slice<2>(temp, nc + 1, nc + 2) +
       reshape(broadcast_with_axis(repmat(range<DType>(
@@ -375,6 +395,7 @@ class YoloOutputOp : public Operator {
       reshape(broadcast_with_axis(range<DType>(0,
       data.shape_[2], 1, data.shape_[3] * param_.num_anchor), -1, data.shape_[0]),
       tshape));
+      
      // anchors
      nnvm::Tuple<DType> anchors(param_.anchors.begin(), param_.anchors.end());
      Tensor<cpu, 1, DType> cpu_bias(anchors.begin(), Shape1(anchors.ndim()));
@@ -383,20 +404,16 @@ class YoloOutputOp : public Operator {
      mshadow::Copy(xpu_bias, cpu_bias, s);
      temp_anchors = reshape(repmat(xpu_bias, data.shape_[0] * data.shape_[2] * data.shape_[3]),
       temp_anchors.shape_);
-    //  Tensor<cpu, 2, DType> debug_anchors = ctx.requested[yoloout_enum::kTempSpace]
-    //   .get_host_space_typed<2, DType>(Shape2(tshape[1], 2));
-    //  Copy(debug_anchors, temp_anchors[0], s);
-    //  for (int ii = 0; ii < tshape[1]; ++ii) {
-    //    LOG(INFO) << "anchor " << ii << ": " << debug_anchors[ii][0] << ", " << debug_anchors[ii][1];
-    //  }
-    //  CHECK_EQ(1, 0);
-     // w = exp(pred[2]) * anchor[w] / in_w
-     slice<2>(out, 4, 5) = in_w * F<mshadow_op::exp>(slice<2>(temp, nc + 3, nc + 4)) *
+     
+
+     slice<2>(out, 4, 5) = in_w * F<fixed_exp>(slice<2>(temp, nc + 3, nc + 4)) *
       slice<2>(temp_anchors, 0, 1);
      // h = exp(pred[3]) * anchor[y] / in_h
-     slice<2>(out, 5, 6) = in_h * F<mshadow_op::exp>(slice<2>(temp, nc + 4, nc + 5)) *
+     slice<2>(out, 5, 6) = in_h * F<fixed_exp>(slice<2>(temp, nc + 4, nc + 5)) *
       slice<2>(temp_anchors, 1, 2);
+     // END  --------------------------------
 
+     // BEGIN  --------------------------------
      // convert output from x, y, w, h to xmin, ymin, xmax, ymax format
      slice<2>(out, 2, 3) -= ScalarExp<DType>(0.5) * slice<2>(out, 4, 5);
      slice<2>(out, 3, 4) -= ScalarExp<DType>(0.5) * slice<2>(out, 5, 6);
@@ -414,65 +431,49 @@ class YoloOutputOp : public Operator {
        int keep = param_.nms_topk < 0 ? out.shape_[1] : param_.nms_topk;
        keep = keep > out.shape_[1] ? out.shape_[1] : keep;
        if (keep > 0) {
-         // descend sort by score
-         int num_batch = out.shape_[0];
-         int num_elem = out.shape_[1];
-         Shape<1> sort_index_shape = Shape1(num_batch * num_elem);
-         Shape<3> buffer_shape = Shape3(num_batch, num_elem, out.shape_[2]);
-         index_t nms_ws_size = 3 * sort_index_shape.Size() + buffer_shape.Size();
-         Tensor<xpu, 1, DType> nms_workspace = ctx.requested[yoloout_enum::kTempSpace]
-          .get_space_typed<xpu, 1, DType>(Shape1(nms_ws_size), s);
-         CHECK_EQ(nms_workspace.CheckContiguous(), true);
-         Tensor<xpu, 1, DType> sorted_index(nms_workspace.dptr_, sort_index_shape, s);
-         Tensor<xpu, 1, DType> scores(sorted_index.dptr_ + sorted_index.MSize(),
-          sort_index_shape, s);
-         Tensor<xpu, 1, DType> batch_id(scores.dptr_ + scores.MSize(),
-          sort_index_shape, s);
-         Tensor<xpu, 3, DType> buffer(batch_id.dptr_ + batch_id.MSize(),
-          buffer_shape, s);
+	 // descend sort by score
+	 int num_batch = out.shape_[0];
+	 int num_elem = out.shape_[1];
+	 Shape<1> sort_index_shape = Shape1(num_batch * num_elem);
+	 Shape<3> buffer_shape = Shape3(num_batch, num_elem, out.shape_[2]);
+	 index_t nms_ws_size = 3 * sort_index_shape.Size() + buffer_shape.Size();
+	 Tensor<xpu, 1, DType> nms_workspace = ctx.requested[yoloout_enum::kTempSpace]
+	  .get_space_typed<xpu, 1, DType>(Shape1(nms_ws_size), s);
+	 CHECK_EQ(nms_workspace.CheckContiguous(), true);
+	 Tensor<xpu, 1, DType> sorted_index(nms_workspace.dptr_, sort_index_shape, s);
+	 Tensor<xpu, 1, DType> scores(sorted_index.dptr_ + sorted_index.MSize(),
+	  sort_index_shape, s);
+	 Tensor<xpu, 1, DType> batch_id(scores.dptr_ + scores.MSize(),
+	  sort_index_shape, s);
+	 Tensor<xpu, 3, DType> buffer(batch_id.dptr_ + batch_id.MSize(),
+	  buffer_shape, s);
 
-         // copy score to buffer, sort accordingly to get sorted index
-         scores = reshape(slice<2>(out, 1, 2), scores.shape_);
-         sorted_index = range<DType>(0, num_batch * num_elem);
-         mshadow::SortByKey(scores, sorted_index, false);
-         batch_id = F<mshadow_op::floor>(sorted_index / ScalarExp<DType>(num_elem));
-         mshadow::SortByKey(batch_id, scores, true);
-         batch_id = F<mshadow_op::floor>(sorted_index / ScalarExp<DType>(num_elem));
-         mshadow::SortByKey(batch_id, sorted_index, true);
+	 // copy score to buffer, sort accordingly to get sorted index
+	 scores = reshape(slice<2>(out, 1, 2), scores.shape_);
+	 sorted_index = range<DType>(0, num_batch * num_elem);
+	 mshadow::SortByKey(scores, sorted_index, false);
+	 batch_id = F<mshadow_op::floor>(sorted_index / ScalarExp<DType>(num_elem));
+	 mshadow::SortByKey(batch_id, scores, true);
+	 batch_id = F<mshadow_op::floor>(sorted_index / ScalarExp<DType>(num_elem));
+	 mshadow::SortByKey(batch_id, sorted_index, true);
 
-         // go through each box as reference, suppress if overlap > threshold
-         // sorted_index with -1 is marked as suppressed
-         for (int ref = 0; ref < keep; ++ref) {
-           int num_worker = keep - ref - 1;
-           if (num_worker < 1) continue;
-           Kernel<nms_impl, xpu>::Launch(s, num_batch * num_worker, sorted_index.dptr_,
-             out.dptr_, num_worker, ref, num_elem, out.shape_[2], 2, 0,
-             param_.nms_threshold, param_.force_suppress);
-         }
+	 // go through each box as reference, suppress if overlap > threshold
+	 // sorted_index with -1 is marked as suppressed
+	 for (int ref = 0; ref < keep; ++ref) {
+	   int num_worker = keep - ref - 1;
+	   if (num_worker < 1) continue;
+	   Kernel<nms_impl, xpu>::Launch(s, num_batch * num_worker, sorted_index.dptr_,
+	     out.dptr_, num_worker, ref, num_elem, out.shape_[2], 2, 0,
+	     param_.nms_threshold, param_.force_suppress);
+	 }
 
-         // store the result
-         buffer = F<mshadow_op::identity>(out);
-         out = -1;
-         Kernel<nms_assign, xpu>::Launch(s, num_batch, out.dptr_,
-          buffer.dptr_, sorted_index.dptr_, keep, num_elem, out.shape_[2]);
+	 // store the result
+	 buffer = F<mshadow_op::identity>(out);
+	 out = -1;
+	 Kernel<nms_assign, xpu>::Launch(s, num_batch, out.dptr_,
+	  buffer.dptr_, sorted_index.dptr_, keep, num_elem, out.shape_[2]);
        }
      }
-
-      // Tensor<cpu, 3, DType> debug_bias = ctx.requested[yoloout_enum::kTempSpace]
-      //  .get_host_space_typed<3, DType>(temp.shape_);
-      // Copy(debug_bias, temp, s);
-      // for (int i = 0; i < 845; ++i) {
-      //   LOG(INFO) << i << ": " << debug_bias[0][i][0 + 20] << ", " << debug_bias[0][i][21];
-      // }
-
-      // Tensor<cpu, 2, DType> debug = ctx.requested[yoloout_enum::kTempSpace]
-      //  .get_host_space_typed<2, DType>(Shape2(temp.shape_[1], 6));
-      // Copy(debug, out[0], s);
-      // for (int ii = 0; ii < debug.shape_[0]; ++ii) {
-      //   LOG(INFO) << ii << ": " << debug[ii][0] << ", " << debug[ii][1] << ", "
-      //    << debug[ii][2] << ", " << debug[ii][3] << ", " << debug[ii][4] << ", "
-      //    << debug[ii][5];
-      // }
   }
 
   virtual void Backward(const OpContext &ctx,
@@ -619,60 +620,6 @@ class YoloOutputOp : public Operator {
     // transpose grad to data shape
     grad = transpose(reshape(temp_grad, Shape4(num_batch, in_height,
       in_width, num_anchor * grad_width)), Shape4(0, 3, 1, 2));
-
-    // Tensor<cpu, 3, DType> debug = ctx.requested[yoloout_enum::kTempSpace]
-    //  .get_host_space_typed<3, DType>(Shape3(125, in_height, in_width));
-    // Copy(debug, grad[0], s);
-    // for (int ii = 0; ii < in_height; ++ii) {
-    //   for (int jj = 0; jj < in_width; ++jj) {
-    //     for (int kk = 0; kk < 5; ++kk) {
-    //       std::stringstream ss;
-    //       ss << ii << "-" << jj << "-" << kk << ": ";
-    //       for (int nn = 0; nn < 25; ++nn) {
-    //         ss << "(" << nn << ")" << debug[kk * 25  + nn][jj][ii];
-    //       }
-    //       if (debug[kk * 25][jj][ii] > 1e10 || debug[kk * 25][jj][ii] < -1e10) {
-    //         LOG(INFO) << ss.str();
-    //       }
-    //     }
-    //   }
-    // }
-
-    // Tensor<cpu, 2, DType> debug = ctx.requested[yoloout_enum::kTempSpace]
-    //  .get_host_space_typed<2, DType>(Shape2(845, 25));
-    // Copy(debug, temp_grad[0], s);
-    // for (int ii = 0; ii < 845; ++ii) {
-    //   if (fabs(debug[ii].dptr_[0]) < 1e-10 ) continue;
-    //   std::stringstream ss;
-    //   ss << ii << ": ";
-    //   for (int jj = 0; jj < 25; ++jj) {
-    //     ss << jj << "-" << debug[ii].dptr_[jj] << ", ";
-    //   }
-    //   LOG(INFO) << ss.str();
-    // }
-
-    // store loss in temp_output for metric, [0]:softmax, [1]:object, [2]:box
-    // temp_out = 0;
-    // Tensor<xpu, 2, DType> metric_out = out_data[yoloout_enum::kTemp]
-    //  .get_with_shape<xpu, 2, DType>(Shape2(temp_out.shape_.Size() / num_batch,
-    //  num_batch), s);
-    // metric_out[0] = sumall_except_dim<0>(F<mshadow_op::abs>(slice<2>(temp_grad, 0, nc)));
-    // metric_out[1] = sumall_except_dim<0>(F<mshadow_op::abs>(slice<2>(temp_grad, nc, nc + 1)));
-    // metric_out[2] = sumall_except_dim<0>(F<mshadow_op::abs>(slice<2>(temp_grad, nc + 1, nc + 5)));
-    // Tensor<cpu, 2, DType> loss_debug = ctx.requested[yoloout_enum::kTempSpace]
-    //  .get_host_space_typed<2, DType>(Shape2(3, num_batch));
-    // Copy(loss_debug[0], metric_out[0], s);
-    // Copy(loss_debug[1], metric_out[1], s);
-    // Copy(loss_debug[2], metric_out[2], s);
-    // DType l1 = 0;
-    // DType l2 = 0;
-    // DType l3 = 0;
-    // for (int ii = 0; ii < num_batch; ++ii) {
-    //   l1 += loss_debug[0][ii];
-    //   l2 += loss_debug[1][ii];
-    //   l3 += loss_debug[2][ii];
-    // }
-    // LOG(INFO) << l1 << ", " << l2 << ", " << l3;
   }
 
  private:
